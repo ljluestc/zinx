@@ -208,12 +208,14 @@ func (c *Connection) StartWriter() {
 			err := c.Flush()
 			if err != nil {
 				zlog.Ins().ErrorF("Flush Buff Data error: %v Conn Writer exit", err)
+				c.Stop()
 				return
 			}
 		case data, ok := <-c.msgBuffChan:
 			if ok {
 				if err := c.SendBuf(data); err != nil {
 					zlog.Ins().ErrorF("Send Buff Data error:, %s Conn Writer exit", err)
+					c.Stop()
 					return
 				}
 			} else {
