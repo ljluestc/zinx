@@ -205,22 +205,21 @@ func (c *Client) run() {
 		// Start connection
 		go connect.Start()
 
-		select {
-		case <-c.ctx.Done():
+		if !c.waitConnectionClosed(connect) {
 			connect.Stop()
 			c.setConn(nil)
 			zlog.Ins().InfoF("client exit.")
 			return
-		case <-connect.Context().Done():
-			c.setConn(nil)
-			if !c.shouldReconnect(attempts) {
-				c.notifyErr(errors.New("connection closed"))
-				return
-			}
-			attempts++
-			if !c.waitReconnect() {
-				return
-			}
+		}
+
+		c.setConn(nil)
+		if !c.shouldReconnect(attempts) {
+			c.notifyErr(errors.New("connection closed"))
+			return
+		}
+		attempts++
+		if !c.waitReconnect() {
+			return
 		}
 	}
 }
@@ -247,6 +246,28 @@ func (c *Client) waitReconnect() bool {
 		return false
 	case <-timer.C:
 		return true
+	}
+}
+
+func (c *Client) waitConnectionClosed(connect ziface.IConnection) bool {
+	for {
+		connCtx := connect.Context()
+		if connCtx != nil {
+			select {
+			case <-c.ctx.Done():
+				return false
+			case <-connCtx.Done():
+				return true
+			}
+		}
+
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-c.ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
 	}
 }
 
