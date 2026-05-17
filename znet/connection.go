@@ -120,6 +120,13 @@ type Connection struct {
 
 	// Close callback mutex
 	closeCallbackMutex sync.RWMutex
+
+	// connLock protects c.conn and c.bufWriter from concurrent use during
+	// send/flush operations vs. the finalizer closing the connection.
+	// Send paths take RLock (allowing concurrent writes); finalizer takes
+	// Lock before closing c.conn to wait for in-flight writes to finish.
+	// (保护 c.conn 和 c.bufWriter，防止发送/刷新操作与连接关闭之间的竞态)
+	connLock sync.RWMutex
 }
 
 // newServerConn :for Server, method to create a Server-side connection with Server-specific properties
@@ -368,14 +375,20 @@ func (c *Connection) LocalAddr() net.Addr {
 }
 
 func (c *Connection) Flush() error {
-	if c.isClosed() == true {
+	c.connLock.RLock()
+	defer c.connLock.RUnlock()
+
+	if c.isClosed() {
 		return errors.New("connection closed when flush data")
 	}
 	return c.bufWriter.Flush()
 }
 
 func (c *Connection) Send(data []byte) error {
-	if c.isClosed() == true {
+	c.connLock.RLock()
+	defer c.connLock.RUnlock()
+
+	if c.isClosed() {
 		return errors.New("connection closed when send msg")
 	}
 	_, err := c.conn.Write(data)
@@ -387,7 +400,10 @@ func (c *Connection) Send(data []byte) error {
 }
 
 func (c *Connection) SendBuf(data []byte) error {
-	if c.isClosed() == true {
+	c.connLock.RLock()
+	defer c.connLock.RUnlock()
+
+	if c.isClosed() {
 		return errors.New("connection closed when send msg")
 	}
 	_, err := c.bufWriter.Write(data)
@@ -399,6 +415,16 @@ func (c *Connection) SendBuf(data []byte) error {
 }
 
 func (c *Connection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) error {
+	c.connLock.Lock()
+	if c.isClosed() {
+		c.connLock.Unlock()
+		return errors.New("Connection closed when send buff msg")
+	}
+	if data == nil {
+		c.connLock.Unlock()
+		zlog.Ins().ErrorF("Pack data is nil")
+		return errors.New("Pack data is nil")
+	}
 
 	if c.msgBuffChan == nil && c.setStartWriterFlag() {
 		c.msgBuffChan = make(chan []byte, zconf.GlobalObject.MaxMsgChanLen)
@@ -408,6 +434,8 @@ func (c *Connection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) erro
 		// 此方法只读取MsgBuffChan中的数据没调用SendBuffMsg可以分配内存和启用协程)
 		go c.StartWriter()
 	}
+	msgBuffChan := c.msgBuffChan
+	c.connLock.Unlock()
 
 	opt := ziface.MsgSendOptionObj{
 		Timeout: 5 * time.Millisecond,
@@ -420,24 +448,13 @@ func (c *Connection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) erro
 	idleTimeout := time.NewTimer(opt.Timeout)
 	defer idleTimeout.Stop()
 
-	if c.isClosed() == true {
-		return errors.New("Connection closed when send buff msg")
-	}
-
-	if data == nil {
-		zlog.Ins().ErrorF("Pack data is nil")
-		return errors.New("Pack data is nil")
-	}
-
 	// Send timeout
 	select {
 	case <-c.ctx.Done():
-		// Close all channels associated with the connection
-		close(c.msgBuffChan)
 		return errors.New("connection closed when send buff msg")
 	case <-idleTimeout.C:
 		return errors.New("send buff msg timeout")
-	case c.msgBuffChan <- data:
+	case msgBuffChan <- data:
 		return nil
 	}
 }
@@ -517,8 +534,12 @@ func (c *Connection) finalizer() {
 		c.hc.Stop()
 	}
 
-	// Close the socket connection
+	// Acquire exclusive lock to wait for any in-flight send/flush operations
+	// to complete before closing the underlying connection.
+	// (获取写锁，等待所有正在进行的发送/刷新操作完成后再关闭底层连接)
+	c.connLock.Lock()
 	_ = c.conn.Close()
+	c.connLock.Unlock()
 
 	// Remove the connection from the connection manager
 	if c.connManager != nil {
