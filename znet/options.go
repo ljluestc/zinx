@@ -3,6 +3,7 @@ package znet
 import (
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/aceld/zinx/ziface"
 )
@@ -48,5 +49,26 @@ func WithUrl(url *url.URL) ClientOption {
 func WithWsHeader(header http.Header) ClientOption {
 	return func(c ziface.IClient) {
 		c.SetWsHeader(header)
+	}
+}
+
+// Enable or disable auto reconnect for client
+func WithAutoReconnect(autoReconnect bool) ClientOption {
+	return func(c ziface.IClient) {
+		c.SetAutoReconnect(autoReconnect)
+	}
+}
+
+// Set reconnect retry interval for client
+func WithReconnectInterval(interval time.Duration) ClientOption {
+	return func(c ziface.IClient) {
+		c.SetReconnectInterval(interval)
+	}
+}
+
+// Set maximum reconnect attempts for client, <=0 means unlimited
+func WithMaxReconnectAttempts(attempts int) ClientOption {
+	return func(c ziface.IClient) {
+		c.SetMaxReconnectAttempts(attempts)
 	}
 }
