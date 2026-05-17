@@ -63,6 +63,10 @@ type Connection struct {
 	// (有缓冲管道，用于读、写两个goroutine之间的消息通信)
 	msgBuffChan chan []byte
 
+	// Channel used to notify writer goroutine to exit
+	// (用于通知写协程退出的channel)
+	writerStopChan chan struct{}
+
 	// Go StartWriter Flag
 	// (开始初始化写协程标志)
 	startWriterFlag int32
@@ -134,6 +138,7 @@ func newServerConn(server ziface.IServer, conn net.Conn, connID uint64) ziface.I
 		connIdStr:       strconv.FormatUint(connID, 10),
 		startWriterFlag: 0,
 		msgBuffChan:     nil,
+		writerStopChan:  nil,
 		property:        nil,
 		name:            server.ServerName(),
 		localAddr:       conn.LocalAddr().String(),
@@ -172,6 +177,7 @@ func newClientConn(client ziface.IClient, conn net.Conn) ziface.IConnection {
 		connIdStr:       "", // client ignore
 		startWriterFlag: 0,
 		msgBuffChan:     nil,
+		writerStopChan:  nil,
 		property:        nil,
 		name:            client.GetName(),
 		localAddr:       conn.LocalAddr().String(),
@@ -223,6 +229,8 @@ func (c *Connection) StartWriter() {
 				return
 			}
 		case <-c.ctx.Done():
+			return
+		case <-c.writerStopChan:
 			return
 		}
 	}
@@ -404,6 +412,7 @@ func (c *Connection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) erro
 
 	if c.msgBuffChan == nil && c.setStartWriterFlag() {
 		c.msgBuffChan = make(chan []byte, zconf.GlobalObject.MaxMsgChanLen)
+		c.writerStopChan = make(chan struct{})
 		// Start a Goroutine to write data back to the client
 		// This method only reads data from the MsgBuffChan without allocating memory or starting a Goroutine
 		// (开启用于写回客户端数据流程的Goroutine
@@ -434,8 +443,6 @@ func (c *Connection) SendToQueue(data []byte, opts ...ziface.MsgSendOption) erro
 	// Send timeout
 	select {
 	case <-c.ctx.Done():
-		// Close all channels associated with the connection
-		close(c.msgBuffChan)
 		return errors.New("connection closed when send buff msg")
 	case <-idleTimeout.C:
 		return errors.New("send buff msg timeout")
@@ -525,6 +532,10 @@ func (c *Connection) finalizer() {
 	// Remove the connection from the connection manager
 	if c.connManager != nil {
 		c.connManager.Remove(c)
+	}
+
+	if c.writerStopChan != nil {
+		close(c.writerStopChan)
 	}
 
 	go func() {
