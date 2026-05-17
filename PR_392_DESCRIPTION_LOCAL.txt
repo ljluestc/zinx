@@ -1,0 +1,66 @@
+PR 标题
+fix(client): preserve decode-to-router message order when worker pool is disabled
+
+关联 Issue
+Closes #392
+
+变更摘要
+本 PR 修复了客户端模式下，在使用自定义解码器且未启用 worker pool 时，消息进入路由处理的顺序可能与解码顺序不一致的问题。
+
+修复前，无 worker pool 分支会为每个请求启动独立 goroutine，导致同一连接内请求并发执行，可能出现后到消息先进入 handler 的情况。
+
+问题现象
+在客户端模式（`newCliMsgHandle`）中，`WorkerPoolSize` 被设置为 `0`。
+`MsgHandle.Intercept` 在 worker pool 关闭时使用了：
+- `go mh.doMsgHandler(...)`
+- `go mh.doMsgHandlerSlices(...)`
+
+上述异步分发会打破单连接消息串行语义。如果第一条消息处理较慢，后续消息可能先进入路由，从而出现“解码顺序 != 路由处理顺序”。
+
+根因分析
+无 worker pool 的处理路径在所有模式下都使用异步 goroutine 分发；但客户端业务通常期望单连接严格有序处理，二者语义不一致。
+
+修改内容
+1) 为 `MsgHandle` 增加 `clientMode` 标记：
+- `newMsgHandle()`（服务端）：`clientMode=false`
+- `newCliMsgHandle()`（客户端）：`clientMode=true`
+
+2) 调整 `MsgHandle.Intercept` 在无 worker pool 分支的行为：
+- 客户端模式：改为同步执行路由，保证顺序
+  - `mh.doMsgHandler(...)` / `mh.doMsgHandlerSlices(...)`
+- 服务端模式：保持原有异步 goroutine 行为（兼容历史语义）
+  - `go mh.doMsgHandler(...)` / `go mh.doMsgHandlerSlices(...)`
+
+3) 增加回归测试：
+- `TestClientMsgHandleNoWorkerPoolPreservesOrder`
+  - 验证客户端模式下顺序保持为 [1,2]
+- `TestServerMsgHandleNoWorkerPoolRemainsAsync`
+  - 验证服务端无 worker pool 仍保持异步行为（延迟首条后顺序为 [2,1]）
+
+涉及文件
+- `znet/msghandler.go`
+- `znet/msghandler_client_order_test.go`（新增）
+
+修复后行为
+- 客户端模式 + 自定义解码器 + 无 worker pool：
+  - 路由执行顺序与解码输出顺序一致（单连接内）。
+- 服务端无 worker pool 路径：
+  - 维持异步行为，不改变既有兼容性。
+
+测试方式
+1) 运行定向回归测试：
+`go -C /home/calelin/dev/zinx test ./znet -run 'TestClientMsgHandleNoWorkerPoolPreservesOrder|TestServerMsgHandleNoWorkerPoolRemainsAsync' -count=1`
+
+2) 重复运行客户端顺序测试，验证稳定性：
+`go -C /home/calelin/dev/zinx test ./znet -run TestClientMsgHandleNoWorkerPoolPreservesOrder -count=10`
+
+本地验证结果
+1) 定向回归测试输出：
+`ok  	github.com/aceld/zinx/znet	0.244s`
+
+2) 重复顺序测试输出：
+`ok  	github.com/aceld/zinx/znet	1.207s`
+
+风险评估
+低风险。
+改动仅作用于无 worker pool 分发分支，且仅将客户端模式调整为同步执行以保证顺序正确性；服务端行为保持不变。
