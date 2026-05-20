@@ -3,6 +3,7 @@ package znet
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -59,6 +60,12 @@ type Client struct {
 	dialer *websocket.Dialer
 	// Error channel
 	errChan chan error
+	// Auto reconnect switch
+	autoReconnect bool
+	// Reconnect interval
+	reconnectInterval time.Duration
+	// Maximum reconnect attempts, <=0 means unlimited
+	maxReconnectAttempts int
 }
 
 func NewClient(ip string, port int, opts ...ClientOption) ziface.IClient {
@@ -70,11 +77,14 @@ func NewClient(ip string, port int, opts ...ClientOption) ziface.IClient {
 		Ip:   ip,
 		Port: port,
 
-		msgHandler: newCliMsgHandle(),
-		packet:     zpack.Factory().NewPack(ziface.ZinxDataPack), // Default to using Zinx's TLV packet format(默认使用zinx的TLV封包方式)
-		decoder:    zdecoder.NewTLVDecoder(),                     // Default to using Zinx's TLV decoder(默认使用zinx的TLV解码器)
-		version:    "tcp",
-		errChan:    make(chan error, 1),
+		msgHandler:           newCliMsgHandle(),
+		packet:               zpack.Factory().NewPack(ziface.ZinxDataPack), // Default to using Zinx's TLV packet format(默认使用zinx的TLV封包方式)
+		decoder:              zdecoder.NewTLVDecoder(),                     // Default to using Zinx's TLV decoder(默认使用zinx的TLV解码器)
+		version:              "tcp",
+		errChan:              make(chan error, 1),
+		autoReconnect:        true,
+		reconnectInterval:    time.Second,
+		maxReconnectAttempts: 0,
 	}
 
 	// Apply Option settings (应用Option设置)
@@ -94,12 +104,15 @@ func NewWsClient(ip string, port int, opts ...ClientOption) ziface.IClient {
 		Ip:   ip,
 		Port: port,
 
-		msgHandler: newCliMsgHandle(),
-		packet:     zpack.Factory().NewPack(ziface.ZinxDataPack), // Default to using Zinx's TLV packet format(默认使用zinx的TLV封包方式)
-		decoder:    zdecoder.NewTLVDecoder(),                     // Default to using Zinx's TLV decoder(默认使用zinx的TLV解码器)
-		version:    "websocket",
-		dialer:     &websocket.Dialer{},
-		errChan:    make(chan error, 1),
+		msgHandler:           newCliMsgHandle(),
+		packet:               zpack.Factory().NewPack(ziface.ZinxDataPack), // Default to using Zinx's TLV packet format(默认使用zinx的TLV封包方式)
+		decoder:              zdecoder.NewTLVDecoder(),                     // Default to using Zinx's TLV decoder(默认使用zinx的TLV解码器)
+		version:              "websocket",
+		dialer:               &websocket.Dialer{},
+		errChan:              make(chan error, 1),
+		autoReconnect:        true,
+		reconnectInterval:    time.Second,
+		maxReconnectAttempts: 0,
 	}
 
 	// Apply Option settings (应用Option设置)
@@ -148,63 +161,37 @@ func (c *Client) Restart() {
 	zlog.Ins().InfoF("[START] Zinx Client dial RemoteAddr: %s:%d\n", c.Ip, c.Port)
 	go func() {
 		defer c.Done()
+		c.run()
+	}()
+}
 
-		// Create a raw socket and get net.Conn (创建原始Socket，得到net.Conn)
-		var connect ziface.IConnection
-		switch c.version {
-		case "websocket":
-			wsAddr := fmt.Sprintf("ws://%s:%d", c.Ip, c.Port)
-			if c.Url != nil {
-				wsAddr = c.Url.String()
-			}
-
-			// Create a raw socket and get net.Conn (创建原始Socket，得到net.Conn)
-			wsConn, _, err := c.dialer.DialContext(c.ctx, wsAddr, c.WsHeader)
-			if err != nil {
-				// connection failed
-				zlog.Ins().ErrorF("WsClient connect to server failed, err:%v", err)
-				c.notifyErr(err)
-				return
-			}
-			// Create Connection object
-			connect = newWsClientConn(c, wsConn)
-
+func (c *Client) run() {
+	attempts := 0
+	for {
+		select {
+		case <-c.ctx.Done():
+			zlog.Ins().InfoF("client exit.")
+			c.setConn(nil)
+			return
 		default:
-			var conn net.Conn
-			var err error
-			if c.useTLS {
-				// TLS encryption
-				config := &tls.Config{
-					// Skip certificate verification here because the CA certificate of the certificate issuer is not authenticated
-					// (这里是跳过证书验证，因为证书签发机构的CA证书是不被认证的)
-					InsecureSkipVerify: true,
-				}
-				d := &tls.Dialer{
-					Config: config,
-				}
-				//conn, err = tls.Dial("tcp", fmt.Sprintf("%v:%v", net.ParseIP(c.Ip), c.Port), config)
-				conn, err = d.DialContext(c.ctx, "tcp", fmt.Sprintf("%v:%v", net.ParseIP(c.Ip), c.Port))
-				if err != nil {
-					zlog.Ins().ErrorF("tls client connect to server failed, err:%v", err)
-					c.notifyErr(err)
-					return
-				}
-			} else {
-				//conn, err = net.DialTCP("tcp", nil, addr)
-				d := &net.Dialer{}
-				conn, err = d.DialContext(c.ctx, "tcp", fmt.Sprintf("%v:%v", net.ParseIP(c.Ip), c.Port))
-				if err != nil {
-					// connection failed
-					zlog.Ins().ErrorF("client connect to server failed, err:%v", err)
-					c.notifyErr(err)
-					return
-				}
-			}
-			// Create Connection object
-			connect = newClientConn(c, conn)
 		}
 
-		// Set connection to the client
+		connect, err := c.dial(c.ctx)
+		if err != nil {
+			c.notifyErr(err)
+			if !c.shouldReconnect(attempts) {
+				c.setConn(nil)
+				return
+			}
+			attempts++
+			if !c.waitReconnect() {
+				c.setConn(nil)
+				return
+			}
+			continue
+		}
+
+		attempts = 0
 		c.setConn(connect)
 
 		zlog.Ins().InfoF("[START] Zinx Client LocalAddr: %s, RemoteAddr: %s\n", connect.LocalAddr(), connect.RemoteAddr())
@@ -218,9 +205,112 @@ func (c *Client) Restart() {
 		// Start connection
 		go connect.Start()
 
-		<-c.ctx.Done()
-		zlog.Ins().InfoF("client exit.")
-	}()
+		if !c.waitConnectionClosed(connect) {
+			connect.Stop()
+			c.setConn(nil)
+			zlog.Ins().InfoF("client exit.")
+			return
+		}
+
+		c.setConn(nil)
+		if !c.shouldReconnect(attempts) {
+			c.notifyErr(errors.New("connection closed"))
+			return
+		}
+		attempts++
+		if !c.waitReconnect() {
+			return
+		}
+	}
+}
+
+func (c *Client) shouldReconnect(attempts int) bool {
+	if !c.autoReconnect {
+		return false
+	}
+	if c.maxReconnectAttempts <= 0 {
+		return true
+	}
+	return attempts < c.maxReconnectAttempts
+}
+
+func (c *Client) waitReconnect() bool {
+	retryInterval := c.reconnectInterval
+	if retryInterval <= 0 {
+		retryInterval = time.Second
+	}
+	timer := time.NewTimer(retryInterval)
+	defer timer.Stop()
+	select {
+	case <-c.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (c *Client) waitConnectionClosed(connect ziface.IConnection) bool {
+	for {
+		connCtx := connect.Context()
+		if connCtx != nil {
+			select {
+			case <-c.ctx.Done():
+				return false
+			case <-connCtx.Done():
+				return true
+			}
+		}
+
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-c.ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) dial(ctx context.Context) (ziface.IConnection, error) {
+	switch c.version {
+	case "websocket":
+		wsAddr := fmt.Sprintf("ws://%s:%d", c.Ip, c.Port)
+		if c.Url != nil {
+			wsAddr = c.Url.String()
+		}
+
+		wsConn, _, err := c.dialer.DialContext(ctx, wsAddr, c.WsHeader)
+		if err != nil {
+			zlog.Ins().ErrorF("WsClient connect to server failed, err:%v", err)
+			return nil, err
+		}
+		return newWsClientConn(c, wsConn), nil
+	default:
+		if c.useTLS {
+			config := &tls.Config{
+				// Skip certificate verification here because the CA certificate of the certificate issuer is not authenticated
+				// (这里是跳过证书验证，因为证书签发机构的CA证书是不被认证的)
+				InsecureSkipVerify: true,
+			}
+			d := &tls.Dialer{
+				Config: config,
+			}
+			conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%v:%v", net.ParseIP(c.Ip), c.Port))
+			if err != nil {
+				zlog.Ins().ErrorF("tls client connect to server failed, err:%v", err)
+				return nil, err
+			}
+			return newClientConn(c, conn), nil
+		}
+
+		d := &net.Dialer{}
+		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%v:%v", net.ParseIP(c.Ip), c.Port))
+		if err != nil {
+			zlog.Ins().ErrorF("client connect to server failed, err:%v", err)
+			return nil, err
+		}
+		return newClientConn(c, conn), nil
+	}
 }
 
 // Start starts the client, sends requests and establishes a connection.
@@ -380,4 +470,28 @@ func (c *Client) SetWsHeader(header http.Header) {
 
 func (c *Client) GetWsHeader() http.Header {
 	return c.WsHeader
+}
+
+func (c *Client) SetAutoReconnect(autoReconnect bool) {
+	c.autoReconnect = autoReconnect
+}
+
+func (c *Client) GetAutoReconnect() bool {
+	return c.autoReconnect
+}
+
+func (c *Client) SetReconnectInterval(interval time.Duration) {
+	c.reconnectInterval = interval
+}
+
+func (c *Client) GetReconnectInterval() time.Duration {
+	return c.reconnectInterval
+}
+
+func (c *Client) SetMaxReconnectAttempts(attempts int) {
+	c.maxReconnectAttempts = attempts
+}
+
+func (c *Client) GetMaxReconnectAttempts() int {
+	return c.maxReconnectAttempts
 }

@@ -82,4 +82,22 @@ type IClient interface {
 	// Get custom headers for WebSocket connection
 	// 获取WebSocket连接的自定义请求头
 	GetWsHeader() http.Header
+
+	// Set whether to automatically reconnect after dial failure or disconnection
+	SetAutoReconnect(bool)
+
+	// Get whether auto reconnect is enabled
+	GetAutoReconnect() bool
+
+	// Set reconnect retry interval
+	SetReconnectInterval(time.Duration)
+
+	// Get reconnect retry interval
+	GetReconnectInterval() time.Duration
+
+	// Set maximum reconnect attempts, <=0 means unlimited
+	SetMaxReconnectAttempts(int)
+
+	// Get maximum reconnect attempts
+	GetMaxReconnectAttempts() int
 }
