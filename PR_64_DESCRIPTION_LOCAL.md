@@ -1,71 +1,73 @@
 ### What problem does this PR solve?
-
 Issue Number: ref #64
 
-当服务器宕机时，zinx 客户端没有自动重连机制。用户需要手动实现重连逻辑。
+当前 `zinx` 客户端在以下场景缺少内置断线重连能力：
+- 启动时服务端暂不可用，首次连接失败后客户端直接退出。
+- 连接建立后服务端异常中断，客户端不会自动重连。
 
-本 PR 在 `Client` 中添加了内置的断线重连支持，当连接失败或断开时，客户端会自动重试连接直到服务器恢复。
+结果是业务方必须自行实现重连逻辑，且不同项目行为不一致。
+
+本 PR 为 `Client` 增加统一的自动重连能力：连接失败或断开后，客户端可按策略持续重试直到服务端恢复（或达到配置的重试上限）。
+
+### Root cause
+- 客户端生命周期是“单次连接尝试”模型，缺少统一重试循环。
+- 缺少可配置的重连策略（开关、间隔、重试次数）。
+- 重启/重连过程中连接上下文初始化存在竞态窗口，需要安全等待机制。
 
 ### What changed and how does it work?
+#### 1) Client 增加重连配置字段
+- `autoReconnect bool`：是否自动重连（默认开启）
+- `reconnectInterval time.Duration`：重试间隔（默认 1s）
+- `maxReconnectAttempts int`：最大重试次数（0 表示无限）
 
-**新增 `Client` 字段：**
-- `autoReconnect bool` — 是否启用自动重连（默认启用）
-- `reconnectInterval time.Duration` — 重试间隔（默认 1 秒）
-- `maxReconnectAttempts int` — 最大重试次数（0 = 无限）
+#### 2) 新增配置项（ClientOption）
+- `WithAutoReconnect(bool)`
+- `WithReconnectInterval(time.Duration)`
+- `WithMaxReconnectAttempts(int)`
 
-**新增 `ClientOption`：**
-- `WithAutoReconnect(bool)` — 启用/禁用自动重连
-- `WithReconnectInterval(time.Duration)` — 设置重试间隔
-- `WithMaxReconnectAttempts(int)` — 设置最大重试次数
-
-**新增 `IClient` 接口方法：**
+#### 3) 扩展 `IClient` 接口能力
 - `SetAutoReconnect(bool)` / `GetAutoReconnect() bool`
 - `SetReconnectInterval(time.Duration)` / `GetReconnectInterval() time.Duration`
 - `SetMaxReconnectAttempts(int)` / `GetMaxReconnectAttempts() int`
 
-**核心逻辑：**
-- 重构 `Restart()` → `run()` 循环，统一处理首次连接失败和运行中连接断开
-- `dial()` 提取为独立方法，支持 TCP / TLS / WebSocket
-- 增加 `waitConnectionClosed()`，避免连接启动阶段 `Context()` 初始化竞态导致空指针
-- 连接断开后通过连接上下文触发重连循环
-- 使用 `waitReconnect()` 配合 `ctx.Done()` 实现可取消的等待
+#### 4) 连接生命周期重构
+- 将 `Restart()` 逻辑重构为统一 `run()` 循环：
+  - 处理首次 `dial` 失败重试
+  - 处理连接存活期断线后的重连
+  - 根据 `maxReconnectAttempts` 决定停止或继续
+- 抽离 `dial()`，统一 TCP/TLS/WebSocket 建连入口
+- 引入 `waitReconnect()`：重连等待阶段可被 `ctx.Done()` 打断，停止更及时
+- 引入 `waitConnectionClosed()`：安全等待连接上下文，规避启动阶段空上下文竞态
 
-**测试：**
-- `TestClientReconnectWhenServerRecovers` — 服务器延迟启动，验证客户端等待并成功连接
-- `TestClientReconnectAfterConnectionClosed` — 服务器断开后重启，验证客户端自动重连
+#### 5) 新增回归测试
+- `TestClientReconnectWhenServerRecovers`
+  - 先让服务端不可用，再恢复，验证客户端可自动连上。
+- `TestClientReconnectAfterConnectionClosed`
+  - 建立连接后模拟断开，再恢复服务端，验证自动重连。
 
-### Check List
+### Files changed
+- `ziface/iclient.go`
+- `znet/options.go`
+- `znet/client.go`
+- `znet/client_reconnect_test.go`
 
-Tests
+### Compatibility / risk
+- 向后兼容：保留可配置行为，用户可通过 `WithAutoReconnect(false)` 关闭自动重连。
+- 风险点主要在连接生命周期时序，已通过专门重连测试覆盖关键路径。
 
-- [x] Unit test
-- [ ] Integration test
-- [ ] Manual test
-- [ ] No need to test
-
-验证命令：
+### Validation
+已执行并通过的验证命令：
 ```bash
 go test ./znet -run 'TestClientReconnectWhenServerRecovers|TestClientReconnectAfterConnectionClosed' -count=1
-go test ./znet -run TestNonExistent -count=1
 ```
 
-Side effects
-
-- [ ] Performance regression: Consumes more CPU
-- [ ] Performance regression: Consumes more Memory
-- [ ] Breaking backward compatibility
-
-自动重连默认启用，但可通过 `WithAutoReconnect(false)` 禁用，保持向后兼容。
-
-Documentation
-
-- [ ] Affects user behaviors
-- [ ] Contains syntax changes
-- [ ] Contains variable changes
-- [ ] Contains experimental features
+### Branch / commits
+- Branch: `private/issue-64-client-auto-reconnect`
+- Commits:
+  - `e6b9399` feat(znet): add automatic reconnection support to Client
+  - `55510d5` fix(client): keep retrying connection and reconnect on disconnect
 
 ### Release note
-
 ```release-note
-为 Client 添加自动断线重连支持。服务器宕机后客户端自动重试连接直到服务器恢复。可通过 WithAutoReconnect、WithReconnectInterval、WithMaxReconnectAttempts 配置。
+为 Client 增加自动断线重连能力：当服务端暂不可用或连接中断后，客户端可按配置自动重试连接。支持重连开关、重连间隔和最大重试次数配置。
 ```
